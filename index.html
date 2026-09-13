@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1a0f08">
+<title>Vighnaharta — Remover of Obstacles</title>
+<link rel="icon" type="image/png" href="favicon.png">
+<style>
+  :root { --gold:#f2c14e; --saffron:#ff9933; }
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#120a05; touch-action:none;
+    font-family:"Georgia","Times New Roman",serif; overscroll-behavior:none; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; image-rendering:auto; background:#120a05; }
+  #rotate { position:fixed; inset:0; background:#1a0f08; color:var(--gold); display:none;
+    flex-direction:column; align-items:center; justify-content:center; gap:14px; text-align:center;
+    z-index:50; font-size:20px; letter-spacing:1px; }
+  #rotate .icon { font-size:56px; animation:rot 2s ease-in-out infinite; }
+  @keyframes rot { 0%,20%{transform:rotate(0)} 55%,80%{transform:rotate(90deg)} 100%{transform:rotate(90deg)} }
+  #rotate small { color:#c9a86a; font-size:13px; max-width:280px; line-height:1.5; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<div id="rotate">
+  <div class="icon">📱</div>
+  <div>Rotate your device<br>to landscape</div>
+  <small>Vighnaharta plays best in landscape. Portrait works, but the view is tight.</small>
+</div>
+<script>
+"use strict";
+// ============ CANVAS & SCALING ============
+const VW = 1280, VH = 720;                 // virtual resolution (all game logic uses this)
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let renderScale = 1;                        // dynamic: lowers on slow devices
+let viewW = VW, viewH = VH;                 // actual canvas pixel size
+
+function fitCanvas() {
+  const ww = Math.max(window.innerWidth, 320), wh = Math.max(window.innerHeight, 240); // guard: transient 0-size viewports
+  const s = Math.min(ww / VW, wh / VH);
+  canvas.style.width = Math.floor(VW * s) + 'px';
+  canvas.style.height = Math.floor(VH * s) + 'px';
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const target = Math.min(dpr * s, 1.5);    // never waste fill-rate above 1.5x virtual
+  const allowed = [1, 1.25, 1.5];
+  renderScale = allowed.reduce((a, b) => Math.abs(b - target) < Math.abs(a - target) ? b : a, 1);
+  canvas.width = Math.floor(VW * renderScale);
+  canvas.height = Math.floor(VH * renderScale);
+  viewW = canvas.width; viewH = canvas.height;
+  // portrait hint (not a block — game still runs behind it)
+  document.getElementById('rotate').style.display =
+    (wh > ww * 1.15 && 'ontouchstart' in window) ? 'flex' : 'none';
+}
+window.addEventListener('resize', fitCanvas);
+window.addEventListener('orientationchange', () => setTimeout(fitCanvas, 250));
+fitCanvas();
+
+// ============ UTILS ============
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const rnd = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
+const rndi = (a, b) => Math.floor(rnd(a, b + 1));
+const chance = p => Math.random() < p;
+const dist2 = (ax, ay, bx, by) => { const dx = bx - ax, dy = by - ay; return dx * dx + dy * dy; };
+const approach = (v, target, d) => v < target ? Math.min(v + d, target) : Math.max(v - d, target);
+function fmtTime(t) { const m = Math.floor(t / 60), s = Math.floor(t % 60); return m + ':' + String(s).padStart(2, '0'); }
+
+// ============ INPUT ============
+// Unified action model. Keyboard/mouse per brief; touch overlay feeds the same actions.
+const Input = {
+  keys: {}, mouse: { x: VW / 2, y: VH / 2, inCanvas: false },
+  // actions: left,right,up,down,jump,dash,axe,noose,trunk,interact,pause
+  // per-action: held, pressed (this frame), released (this frame)
+  _held: {}, _pressed: {}, _released: {},
+  _validFrame: 0,
+  touchActive: false,
+  aim: { x: 1, y: 0 },           // world-space aim dir (normalized-ish), from mouse or facing
+
+  actionHeld(a) { return !!this._held[a]; },
+  actionPressed(a) { return this._pressed[a] === this._validFrame; },
+  actionReleased(a) { return this._released[a] === this._validFrame; },
+  _frame() { this._validFrame++; },
+  _clear() { for (const k in this._pressed) delete this._pressed[k]; for (const k in this._released) delete this._released[k]; },
+
+  KEYMAP: {
+    'KeyA': 'left', 'ArrowLeft': 'left', 'KeyD': 'right', 'ArrowRight': 'right',
+    'KeyW': 'up', 'ArrowUp': 'up', 'KeyS': 'down', 'ArrowDown': 'down',
+    'Space': 'jump', 'ShiftLeft': 'dash', 'ShiftRight': 'dash',
+    'KeyJ': 'axe', 'KeyK': 'noose', 'KeyE': 'trunk', 'KeyL': 'trunk',
+    'KeyF': 'interact', 'Escape': 'pause', 'KeyP': 'pause', 'Enter': 'confirm',
+  },
+  init() {
+    window.addEventListener('keydown', e => {
+      if (e.repeat) { if (this.KEYMAP[e.code]) e.preventDefault(); return; }
+      const a = this.KEYMAP[e.code];
+      if (a) { e.preventDefault(); this._held[a] = true; this._pressed[a] = this._validFrame + 1; }
+      if (e.code === 'Space') e.preventDefault();
+      Audio2.unlock();
+    });
+    window.addEventListener('keyup', e => {
+      const a = this.KEYMAP[e.code];
+      if (a) { e.preventDefault(); this._held[a] = false; this._released[a] = this._validFrame + 1; }
+    });
+    window.addEventListener('blur', () => { this._held = {}; });
+
+    canvas.addEventListener('mousemove', e => { this._setMouse(e); });
+    canvas.addEventListener('mousedown', e => {
+      e.preventDefault(); Audio2.unlock(); this._setMouse(e);
+      const a = e.button === 0 ? 'axe' : e.button === 2 ? 'noose' : null;
+      if (a) { this._held[a] = true; this._pressed[a] = this._validFrame + 1; }
+    });
+    window.addEventListener('mouseup', e => {
+      const a = e.button === 0 ? 'axe' : e.button === 2 ? 'noose' : null;
+      if (a) { this._held[a] = false; this._released[a] = this._validFrame + 1; }
+    });
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+    // ---- Touch controls (virtual joystick left + button cluster right) ----
+    this.touch = {
+      joy: { active: false, id: null, cx: 0, cy: 0, dx: 0, dy: 0 },
+      buttons: [],   // {x,y,r,action} set by game (needs layout)
+    };
+    const opts = { passive: false };
+    canvas.addEventListener('touchstart', e => {
+      e.preventDefault(); Audio2.unlock(); this.touchActive = true;
+      for (const t of e.changedTouches) this._touchStart(t);
+    }, opts);
+    canvas.addEventListener('touchmove', e => {
+      e.preventDefault();
+      for (const t of e.changedTouches) this._touchMove(t);
+    }, opts);
+    const end = e => {
+      e.preventDefault();
+      for (const t of e.changedTouches) this._touchEnd(t);
+    };
+    canvas.addEventListener('touchend', end, opts);
+    canvas.addEventListener('touchcancel', end, opts);
+  },
+  _setMouse(e) {
+    const r = canvas.getBoundingClientRect();
+    this.mouse.x = (e.clientX - r.left) / r.width * VW;
+    this.mouse.y = (e.clientY - r.top) / r.height * VH;
+    this.mouse.inCanvas = true;
+  },
+  // returns screen-space position of a pointer event in virtual coords
+  _virt(t) {
+    const r = canvas.getBoundingClientRect();
+    return { x: (t.clientX - r.left) / r.width * VW, y: (t.clientY - r.top) / r.height * VH };
+  },
+  _touchStart(t) {
+    const p = this._virt(t);
+    // joystick zone: left 45% of screen
+    if (p.x < VW * 0.42 && !this.touch.joy.active) {
+      const j = this.touch.joy;
+      j.active = true; j.id = t.identifier; j.cx = p.x; j.cy = p.y; j.dx = 0; j.dy = 0;
+      return;
+    }
+    // buttons
+    for (const b of this.touch.buttons) {
+      if (dist2(p.x, p.y, b.x, b.y) < b.r * b.r) {
+        b.id = t.identifier; b.down = true;
+        this._held[b.action] = true; this._pressed[b.action] = this._validFrame + 1;
+        return;
+      }
+    }
+    // free tap (UI advance) — consumed by Game.tapOrClick
+    Input.tap = { x: p.x, y: p.y, used: false };
+  },
+  _touchMove(t) {
+    const j = this.touch.joy;
+    if (j.active && t.identifier === j.id) {
+      const p = this._virt(t);
+      const dx = p.x - j.cx, dy = p.y - j.cy, d = Math.hypot(dx, dy), max = 70;
+      if (d > max) { j.cx += dx * (1 - max / d); j.cy += dy * (1 - max / d); }
+      j.dx = clamp((p.x - j.cx) / max, -1, 1); j.dy = clamp((p.y - j.cy) / max, -1, 1);
+    }
+  },
+  _touchEnd(t) {
+    const j = this.touch.joy;
+    if (j.active && t.identifier === j.id) { j.active = false; j.dx = 0; j.dy = 0; j.id = null; return; }
+    for (const b of this.touch.buttons) {
+      if (b.id === t.identifier) {
+        b.id = null; b.down = false;
+        this._held[b.action] = false; this._released[b.action] = this._validFrame + 1;
+      }
+    }
+  },
+  touchAxis() {
+    const j = this.touch.joy;
+    return { x: j.active ? j.dx : 0, y: j.active ? j.dy : 0 };
+  },
+};
+
+// ============ SAVE ============
+const Save = {
+  data: null,
+  DEF() {
+    return {
+      modaks: 0, flowers: 0,
+      up: { heart: 0, stamina: 0, noose: 0, trunk: 0, aura: 0 },
+      unlocked: 1, defeated: [], rescues: {}, seen: {},
+    };
+  },
+  load() {
+    try {
+      const raw = localStorage.getItem('vng_save_v1');
+      this.data = raw ? Object.assign(this.DEF(), JSON.parse(raw)) : this.DEF();
+    } catch (e) { this.data = this.DEF(); }
+    return this.data;
+  },
+  write() { try { localStorage.setItem('vng_save_v1', JSON.stringify(this.data)); } catch (e) {} },
+};
+
+// ============ INPUT FRAME WRAPPER (called at start of each game frame) ============
+Input.init();
+</script>
+<script src="js/audio.js"></script>
+<script src="js/art.js"></script>
+<script src="js/levels.js"></script>
+<script src="js/entities.js"></script>
+<script src="js/bosses.js"></script>
+<script src="js/game.js"></script>
+</body>
+</html>
